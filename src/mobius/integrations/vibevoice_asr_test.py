@@ -177,6 +177,66 @@ def test_host_finalizes_each_variable_length_utterance_at_its_own_endpoint():
     assert lengths.tolist() == [2, 2]
 
 
+def test_iter_chunks_splits_length_that_does_not_divide_evenly():
+    """Uneven terminal chunk keeps padding; reassembled chunks restore the batch."""
+    processor = VibeVoiceASRProcessor()
+    processor.chunk_samples = 6
+    short = np.arange(5, dtype=np.float32)
+    long = np.arange(13, dtype=np.float32) * 0.5
+    batch = processor.prepare_audio([short, long], sampling_rate=24_000)
+    assert batch.input_values.shape == (2, 13)
+
+    chunks = list(processor.iter_chunks(batch))
+    assert [chunk.input_values.shape for chunk in chunks] == [(2, 1, 6), (2, 1, 6), (2, 1, 1)]
+    assert [chunk.padding_mask.shape for chunk in chunks] == [(2, 6), (2, 6), (2, 1)]
+
+    # Window contents are raw column slices of the right-padded batch: padded
+    # columns (zeros) ride along; per-item validity is preserved by the mask.
+    assert np.array_equal(chunks[0].input_values[:, 0], batch.input_values[:, :6])
+    assert np.array_equal(chunks[1].input_values[:, 0], batch.input_values[:, 6:12])
+    assert np.array_equal(chunks[2].input_values[:, 0], batch.input_values[:, 12:13])
+    assert np.array_equal(
+        chunks[2].padding_mask, np.array([[False], [True]], dtype=np.bool_)
+    )
+
+    # Reassembling the windows restores the exact source batch.
+    values = np.concatenate([chunk.input_values[:, 0] for chunk in chunks], axis=1)
+    mask = np.concatenate([chunk.padding_mask for chunk in chunks], axis=1)
+    np.testing.assert_array_equal(values, batch.input_values)
+    np.testing.assert_array_equal(mask, batch.padding_mask)
+
+
+def test_iter_chunks_batches_clips_of_different_lengths():
+    """Padded rows stay raw inside every window; masks isolate valid prefixes."""
+    processor = VibeVoiceASRProcessor()
+    processor.chunk_samples = 4
+    a = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)  # 5 valid samples
+    b = np.array([7.0, 8.0], dtype=np.float32)  # 2 valid samples
+    batch = processor.prepare_audio([a, b], sampling_rate=24_000)
+    assert batch.input_values.shape == (2, 5)
+
+    chunks = list(processor.iter_chunks(batch))
+    assert [chunk.input_values.shape for chunk in chunks] == [(2, 1, 4), (2, 1, 1)]
+
+    # Raw slicing: the longer clip's fifth sample lands in the terminal window,
+    # while the shorter clip contributes its padding columns unmodified.
+    assert np.array_equal(chunks[0].input_values[:, 0], batch.input_values[:, :4])
+    assert np.array_equal(chunks[1].input_values[:, 0], batch.input_values[:, 4:5])
+    assert np.array_equal(chunks[0].padding_mask, np.array([[True] * 4, [True, True, False, False]]))
+    assert np.array_equal(chunks[1].padding_mask, np.array([[True], [False]]))
+
+
+def test_iter_chunks_rejects_no_audio():
+    """An empty batch must fail fast rather than silently yield nothing."""
+    processor = VibeVoiceASRProcessor()
+    empty = VibeVoiceASRBatch(
+        input_values=np.zeros((0, 10), dtype=np.float32),
+        padding_mask=np.zeros((0, 10), dtype=np.bool_),
+    )
+    with pytest.raises(ValueError, match="non-empty batch"):
+        list(processor.iter_chunks(empty))
+
+
 def test_processor_builds_source_chat_template_token_layout():
     class Tokenizer:
         def __init__(self):
